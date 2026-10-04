@@ -429,6 +429,7 @@ class StrataEngine:
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
+        self._request_state = threading.local()
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
@@ -607,18 +608,43 @@ class StrataEngine:
 
     def _parse_done(self, line):
         f = line.split()
-        self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
+        last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
                      "decode_ms": float(f[4]), "finish": f[5]}
         if len(f) >= 9:                                   # the conversation cache's fields (engine 0.1.3+)
-            self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
+            last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
         if len(f) >= 11:                                  # decode hit rate fields
-            self.last.update(hits=int(f[9]), lookups=int(f[10]))
+            last.update(hits=int(f[9]), lookups=int(f[10]))
         if len(f) >= 14:                                  # the expert tiers (engine 0.1.31+): RAM / file blobs, file MB
-            self.last.update(ram_blobs=int(f[11]), file_blobs=int(f[12]), file_mb=float(f[13]))
+            last.update(ram_blobs=int(f[11]), file_blobs=int(f[12]), file_mb=float(f[13]))
         if len(f) >= 15:                                  # #471 (engine 0.1.36+): the prompt tokens actually read
-            self.last.update(prompt_read=int(f[14]))
+            last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
-            self.last.update(offloaded=int(f[15]))
+            last.update(offloaded=int(f[15]))
+        self.last = last
+        if hasattr(self, "_request_state"):
+            records = getattr(self._request_state, "records", None)
+            if records is None:
+                records = self._request_state.records = []
+            records.append(last)
+
+    def _combined_timings(self):
+        """The combined timings of this request's solo and batch segments.
+
+        A solo/batch handoff reuses tokens just read by this same request. Only
+        the first segment's prefix counts as cached input from an earlier request.
+        """
+        records = getattr(self._request_state, "records", [])
+        if not records:
+            return None
+        result = dict(records[-1])
+        for key in ("generated", "prompt_ms", "decode_ms", "prompt_read", "drafts_accepted", "drafts_offered",
+                    "hits", "lookups", "ram_blobs", "file_blobs", "file_mb", "offloaded"):
+            values = [r[key] for r in records if key in r]
+            if values:
+                result[key] = sum(values)
+        result["reused"] = records[0].get("reused", 0)
+        result["prompt_tokens"] = records[0]["prompt_tokens"]
+        return result
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
@@ -1026,9 +1052,13 @@ class StrataEngine:
                     elif line.startswith("BDONE "):
                         phase = "none"
                         f = line.split()
-                        if len(f) >= 5 and isinstance(self.last, dict):
-                            self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
-                                         "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
+                        records = self._request_state.records
+                        last = records[-1] if records else None
+                        if len(f) >= 5 and isinstance(last, dict):
+                            last = {**last, "finish": f[3], "decode_ms": float(f[4]),
+                                    "generated": int(f[2]) if f[2].isdigit() else last.get("generated")}
+                            self.last = last
+                            records[-1] = last
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
@@ -1107,6 +1137,17 @@ class StrataEngine:
         return view
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        if not hasattr(self, "_request_state"):
+            self._request_state = threading.local()
+        self._request_state.records = []
+        try:
+            yield from self._generate(ids, max_new, sampling, cancel, embeddings)
+        finally:
+            combined = self._combined_timings()
+            if combined is not None:
+                self.last = combined
+
+    def _generate(self, ids, max_new, sampling, cancel, embeddings=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""

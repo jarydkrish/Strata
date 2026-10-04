@@ -2681,5 +2681,60 @@ class LostStep(unittest.TestCase):
         self.run_mode("stop", stream=False)
 
 
+class ConcurrentRequestTimings(unittest.TestCase):
+    def engine(self):
+        engine = StrataEngine.__new__(StrataEngine)
+        engine.batch = 4
+        engine._request_state = threading.local()
+        engine.last = {}
+        return engine
+
+    def test_other_admission_cannot_replace_this_requests_usage(self):
+        engine = self.engine()
+        first_done, second_done = threading.Event(), threading.Event()
+        results = {}
+        def first():
+            engine._parse_done('DONE 1 36000 16000 20 length 0 0 0 0 0 0 0 0.0 36000')
+            first_done.set()
+            self.assertTrue(second_done.wait(5))
+            results['first'] = engine._combined_timings()
+        def second():
+            self.assertTrue(first_done.wait(5))
+            engine._parse_done('DONE 1 37000 600 20 length 0 0 36900 0 0 0 0 0.0 100')
+            results['second'] = engine._combined_timings()
+            second_done.set()
+        threads = [threading.Thread(target=first), threading.Thread(target=second)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(10)
+        self.assertEqual(results['first']['reused'], 0)
+        self.assertEqual(results['first']['prompt_read'], 36000)
+        self.assertEqual(results['second']['reused'], 36900)
+
+    def test_handoff_does_not_count_this_requests_prefill_as_cached_input(self):
+        engine = self.engine()
+        engine._parse_done('DONE 1 36000 16000 20 cancel 0 0 0 0 0 0 0 0.0 36000')
+        engine._parse_done('DONE 4 36001 3 80 stop 0 0 36000 0 0 0 0 0.0 1')
+        record = engine._combined_timings()
+        self.assertEqual(record['reused'], 0)
+        self.assertEqual(record['prompt_tokens'], 36000)
+        self.assertEqual(record['prompt_read'], 36001)
+        self.assertEqual(record['prompt_ms'], 16003)
+        self.assertEqual(record['decode_ms'], 100)
+        self.assertEqual(record['generated'], 5)
+
+    def test_new_request_without_done_has_no_previous_usage(self):
+        engine = self.engine()
+        engine._parse_done('DONE 4 36000 10 20 stop 0 0 35900')
+        engine._request_state.records = []
+        self.assertIsNone(engine._combined_timings())
+
+    def test_handoff_preserves_the_initial_real_cache_hit(self):
+        engine = self.engine()
+        engine._parse_done('DONE 1 36000 600 20 cancel 0 0 35000 0 0 0 0 0.0 1000')
+        engine._parse_done('DONE 4 36001 3 80 stop 0 0 36000 0 0 0 0 0.0 1')
+        self.assertEqual(engine._combined_timings()['reused'], 35000)
+        self.assertEqual(engine._combined_timings()['prompt_read'], 1001)
+
+
 if __name__ == "__main__":
     unittest.main()
