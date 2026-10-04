@@ -24,6 +24,13 @@ and ordinary reasoning keep their existing streaming path. `jsonschema` is
 now included in the install requirements. An older install missing it rejects
 forced selection rather than silently weakening validation.
 
+Native XML scalar boolean parameters accept both `true`/`false` and
+`True`/`False` when the schema declares a boolean. The real model used `True`
+in a multi-field probe; previously that became a string and failed validation.
+Streamed and final JSON arguments now agree on the boolean value. String fields
+retain their text; quoted boolean strings, `yes`, numeric values and malformed
+JSON are not coerced into booleans.
+
 Responses `text.format` uses this path with a private schema-bearing tool.
 After validation, its model-generated argument object becomes the JSON text
 message; the internal tool never appears in client events. Schema prompting

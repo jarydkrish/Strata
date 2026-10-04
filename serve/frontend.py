@@ -480,7 +480,10 @@ def parse_tool_call(body: str, schema: dict | None = None, strict=False) -> Tool
             except ToolParseError:
                 raise
             except ValueError:
-                args[pname] = value
+                # Qwen's native XML dialect also spells scalar booleans as
+                # Python literals. Only a declared boolean permits these;
+                # strings and malformed JSON objects are never coerced.
+                args[pname] = value == "True" if declared == "boolean" and value in ("True", "False") else value
     if strict and rest.strip() != "</function>":
         raise ToolParseError("forced tool call has trailing text")
     return ToolCall(name=name, arguments=args)
@@ -511,6 +514,7 @@ class OutputParser:
         self.sfirst = True
         self.sval_started = False
         self.sdeclared = {}
+        self.sparam = None
 
     def _scan(self) -> list[Event]:
         """Advance the streaming view of the call body in self.buf (see stream_tools)."""
@@ -542,6 +546,7 @@ class OutputParser:
                     if b < 0:
                         return out
                     pname = stripped[11:b]
+                    self.sparam = pname
                     args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
                     self.sfirst = False
                     self.sp += b + 1
@@ -593,7 +598,7 @@ class OutputParser:
                 try:
                     v = json.loads(value)
                 except ValueError:
-                    v = value
+                    v = value == "True" if self.sdeclared.get(self.sparam) == "boolean" and value in ("True", "False") else value
                 args(json.dumps(v, ensure_ascii=False))
                 self.sp += end + len(PARAM_END)
                 self.ss = "between"

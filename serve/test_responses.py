@@ -362,6 +362,27 @@ class ToolRoundTrip(Server):
 
 
 class ForcedTools(Server):
+    def test_typed_scalar_booleans_match_streamed_and_final_arguments(self):
+        tool = {"type": "function", "name": "store", "parameters": {
+            "type": "object", "properties": {"active": {"type": "boolean"}, "literal": {"type": "string"}},
+            "required": ["active", "literal"], "additionalProperties": False}}
+        for spelling, value in (("True", True), ("False", False), ("true", True), ("false", False)):
+            self.engine.script = self.tok.encode(
+                f"<parameter=active>\n{spelling}\n</parameter>\n<parameter=literal>\nTrue\n</parameter>\n"
+                "</function>\n</tool_call><|im_end|>", parse_special=True)
+            code, events = self.post({"input": "store", "tools": [tool], "tool_choice": "required", "stream": True})
+            self.assertEqual(events[-1]["type"], "response.completed", events[-1])
+            call = events[-1]["response"]["output"][0]
+            self.assertEqual(json.loads(call["arguments"]), {"active": value, "literal": "True"})
+            streamed = "".join(e["delta"] for e in events if e["type"] == "response.function_call_arguments.delta")
+            self.assertEqual(json.loads(streamed), {"active": value, "literal": "True"})
+        for spelling in ('"True"', "yes", "TRUE", "1"):
+            self.engine.script = self.tok.encode(
+                f"<parameter=active>\n{spelling}\n</parameter>\n<parameter=literal>\nTrue\n</parameter>\n"
+                "</function>\n</tool_call><|im_end|>", parse_special=True)
+            code, result = self.post({"input": "store", "tools": [tool], "tool_choice": "required"})
+            self.assertEqual((code, result["error"]["code"]), (502, "tool_choice_failed"))
+
     script = "<parameter=cmd>\ncat a.txt\n</parameter>\n</function>\n</tool_call>"
 
     def test_named_selection_prefills_and_streams_only_the_validated_call(self):
