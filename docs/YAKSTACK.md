@@ -105,3 +105,42 @@ probes through YakStack's request builder, stream handler and response normalize
 The Ruby probes used an unsaved standard Responses compatibility configuration;
 they did not change application routing or write Message/ToolCall records.
 The engine and memory configuration are unchanged from the full stress run.
+
+## Continuation cache follow-up
+
+Python commit `81307a7c780bb5ac80d31af2428e5284900f72b4`, image
+`sha256:c7c0769c635f6d3ecc79accf5075038f7bec3744e54667d9e6f6562ef866ac41`,
+corrects cache accounting across solo/batch handoffs. The engine and model
+are unchanged. A handoff can reuse history that the same request just read;
+only reuse at the first engine segment counts as cached input from an earlier
+request. Segment timing records are combined before reporting API usage.
+Existing per-thread isolation is retained. The server, Responses, parallel,
+structured-output and security suites passed all 212 tests.
+
+Stable reasoning and a stable tool catalog preserve cache reuse. Fresh
+four-conversation tests with approximately 36K input tokens measured:
+
+| Workload | llama.cpp | Corrected Strata |
+| --- | ---: | ---: |
+| Reasoning off, 40 requests | 201.690 s | 104.698 s |
+| Reasoning on, 24 requests | 168.818 s | 97.855 s |
+| Four auto-tool workflows, 12 requests | 150.112 s | 88.915 s |
+
+All requests completed correctly; all follow-ups reused input, and the four
+initial requests of each workload correctly reported zero cached tokens.
+These are one restarted batch per condition, comparing different models.
+Some tool follow-ups waited longer despite lower whole-workload elapsed time.
+
+With default instruction placement, changing reasoning effort changes the
+beginning of the prompt. Responses `tool_choice: none` also removes the tool
+catalog. Both can reread a long history. `effort_position: end` is an existing,
+opt-in experiment to keep effort changes out of the shared prefix. On the same
+corrected image, the original alternating forty-request workload took
+445.805 seconds with `start` versus 105.331 seconds with `end` (76% less).
+All answers passed. Default placement had 21 of 36 follow-ups with zero
+cached input; trailing placement had none. It changes instruction placement
+from the model's default template, so broad quality remains unqualified. The full comparison
+and bounded engine traces are in the
+[YakStack cache report](https://github.com/CritianZenith/yakstack/blob/evaluate-strata-3090/docs/llm-evaluation-2026-10-04-strata-cache.md).
+The original llama.cpp container is restored between trial windows; this does
+not permanently enable the option or migrate the application.
