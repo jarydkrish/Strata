@@ -51,7 +51,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+from serve.frontend import (ChatTemplate, Event, OutputParser, ToolParseError, anthropic_to_messages,  # noqa: E402
                             images_of, mark_think_literals, openai_to_messages, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
@@ -429,6 +429,7 @@ class StrataEngine:
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
+        self._request_state = threading.local()
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
@@ -607,18 +608,43 @@ class StrataEngine:
 
     def _parse_done(self, line):
         f = line.split()
-        self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
+        last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
                      "decode_ms": float(f[4]), "finish": f[5]}
         if len(f) >= 9:                                   # the conversation cache's fields (engine 0.1.3+)
-            self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
+            last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
         if len(f) >= 11:                                  # decode hit rate fields
-            self.last.update(hits=int(f[9]), lookups=int(f[10]))
+            last.update(hits=int(f[9]), lookups=int(f[10]))
         if len(f) >= 14:                                  # the expert tiers (engine 0.1.31+): RAM / file blobs, file MB
-            self.last.update(ram_blobs=int(f[11]), file_blobs=int(f[12]), file_mb=float(f[13]))
+            last.update(ram_blobs=int(f[11]), file_blobs=int(f[12]), file_mb=float(f[13]))
         if len(f) >= 15:                                  # #471 (engine 0.1.36+): the prompt tokens actually read
-            self.last.update(prompt_read=int(f[14]))
+            last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
-            self.last.update(offloaded=int(f[15]))
+            last.update(offloaded=int(f[15]))
+        self.last = last
+        if hasattr(self, "_request_state"):
+            records = getattr(self._request_state, "records", None)
+            if records is None:
+                records = self._request_state.records = []
+            records.append(last)
+
+    def _combined_timings(self):
+        """The combined timings of this request's solo and batch segments.
+
+        A solo/batch handoff reuses tokens just read by this same request. Only
+        the first segment's prefix counts as cached input from an earlier request.
+        """
+        records = getattr(self._request_state, "records", [])
+        if not records:
+            return None
+        result = dict(records[-1])
+        for key in ("generated", "prompt_ms", "decode_ms", "prompt_read", "drafts_accepted", "drafts_offered",
+                    "hits", "lookups", "ram_blobs", "file_blobs", "file_mb", "offloaded"):
+            values = [r[key] for r in records if key in r]
+            if values:
+                result[key] = sum(values)
+        result["reused"] = records[0].get("reused", 0)
+        result["prompt_tokens"] = records[0]["prompt_tokens"]
+        return result
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
@@ -1026,9 +1052,13 @@ class StrataEngine:
                     elif line.startswith("BDONE "):
                         phase = "none"
                         f = line.split()
-                        if len(f) >= 5 and isinstance(self.last, dict):
-                            self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
-                                         "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
+                        records = self._request_state.records
+                        last = records[-1] if records else None
+                        if len(f) >= 5 and isinstance(last, dict):
+                            last = {**last, "finish": f[3], "decode_ms": float(f[4]),
+                                    "generated": int(f[2]) if f[2].isdigit() else last.get("generated")}
+                            self.last = last
+                            records[-1] = last
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
@@ -1107,6 +1137,17 @@ class StrataEngine:
         return view
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        if not hasattr(self, "_request_state"):
+            self._request_state = threading.local()
+        self._request_state.records = []
+        try:
+            yield from self._generate(ids, max_new, sampling, cancel, embeddings)
+        finally:
+            combined = self._combined_timings()
+            if combined is not None:
+                self.last = combined
+
+    def _generate(self, ids, max_new, sampling, cancel, embeddings=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
@@ -2142,7 +2183,7 @@ class Service:
         prompt, plain = unmark_think_literals(prompt)
         return self.tok.encode(prompt, parse_special=True, plain=plain)
 
-    def prepare(self, messages, tools, kwargs, max_new=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, forced_prefix=""):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
         ids = self.encode_prompt(messages, tools, kwargs)
@@ -2181,6 +2222,8 @@ class Service:
                 for path, _ in encoded:
                     f.write(path.read_bytes())
             self.embeddings.path = combined
+        if forced_prefix:
+            ids += self.tok.encode(forced_prefix, parse_special=True)
         ctx = self.engine.max_context
         if ctx <= 0:
             if getattr(self.engine, "starting", False):   # #344: (re)starting, not a prompt that is too long
@@ -2241,14 +2284,17 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, forced_prefix="") -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
         budget = self.reasoning_budget(sampling) if thinking else None   # #123: opt-in, off by default
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, strict_tools=bool(forced_prefix))
+        if forced_prefix:
+            for ev in parser.feed(forced_prefix):
+                yield "event", ev
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -2332,6 +2378,9 @@ class Service:
                         except EngineDied as e:
                             finish = "error"
                             self._say_died(e)
+                            raise
+                        except ToolParseError:
+                            finish = "error"
                             raise
                         except ValueError as e:             # the engine's ERR line (it may have ended after it)
                             finish = "error"
@@ -3418,7 +3467,7 @@ def make_handler(svc: Service):
             """#451: POST /v1/responses - OpenAI's Responses API, stateless (serve/responses.py), on the chat path.
             Errors use the Responses format; once the stream has started they arrive as a response.failed event."""
             try:
-                ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req)
+                ids, thinking, tools, max_new, asm, validator, req, forced_prefix = self._responses_prepare(req)
             except ResponsesError as e:
                 return self._json(e.status, e.body())
             except ModelBusy as e:
@@ -3434,14 +3483,41 @@ def make_handler(svc: Service):
             def events():
                 yield from asm.start()
                 done = None
-                for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
+                held = []
+                def generation():
+                    try:
+                        yield from svc.run(ids, thinking, tools, max_new, req, cancel, forced_prefix=forced_prefix)
+                    except ToolParseError:
+                        if validator is not None:
+                            raise StructuredOutputError("structured generation returned a malformed call") from None
+                        raise responses_api.ToolChoiceError("forced generation returned a malformed call") from None
+                for kind, x in generation():
                     if kind == "ping":
                         yield None
                     elif kind == "event":
-                        yield from asm.feed(x)
+                        if forced_prefix:
+                            held.append(x)
+                        else:
+                            yield from asm.feed(x)
                     elif kind == "done":
                         done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
+                    if forced_prefix:
+                        try:
+                            responses_api.validate_forced_tools(held, tools, done["finish"])
+                        except responses_api.ToolChoiceError as e:
+                            if validator is not None:
+                                raise StructuredOutputError(str(e)) from None
+                            raise
+                        if validator is not None:
+                            calls = [e.call for e in held if e.kind == "tool_call"]
+                            if len(calls) != 1:
+                                raise StructuredOutputError("structured generation needs exactly one object")
+                            text = json.dumps(calls[0].arguments, ensure_ascii=False, allow_nan=False)
+                            yield from asm.feed(Event("content", text))
+                        else:
+                            for ev in held:
+                                yield from asm.feed(ev)
                     yield from asm.finish(done, check)
             items = self._capture(events(), "responses")
             if not req.get("stream"):
@@ -3450,6 +3526,8 @@ def make_handler(svc: Service):
                 except StructuredOutputError as e:
                     return self._json(502, responses_error_body(str(e), "server_error",
                                                                 code="structured_output_failed"))
+                except responses_api.ToolChoiceError as e:
+                    return self._json(502, responses_error_body(str(e), "server_error", code="tool_choice_failed"))
                 except EngineDied as e:
                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
                                                                 code="server_error"))
@@ -3485,6 +3563,8 @@ def make_handler(svc: Service):
                 self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
+            except responses_api.ToolChoiceError as e:
+                self._responses_failed(asm, str(e), "tool_choice_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
 
@@ -3502,6 +3582,11 @@ def make_handler(svc: Service):
             messages = responses_api.input_messages(req)
             tools, names, skipped = responses_api.request_tools(req)
             kw = responses_api.template_kwargs(req, svc.shared)
+            forced_prefix = responses_api.forced_tool_prefix(req, tools)
+            if forced_prefix:
+                # Start in the call body, with the template's empty reasoning block.
+                # Automatic tools and ordinary reasoning keep their existing path.
+                kw = {**kw, "enable_thinking": False}
             try:
                 messages, validator = prepare_format(responses_api.text_format(req), messages)
             except ValueError as e:
@@ -3509,6 +3594,13 @@ def make_handler(svc: Service):
             if validator is not None and tools:
                 raise ResponsesError("a JSON text.format with tools is not supported", "text.format",
                                      "unsupported_parameter")
+            if validator is not None:
+                fmt = responses_api.text_format(req)
+                schema = fmt["json_schema"]["schema"] if fmt["type"] == "json_schema" else {"type": "object"}
+                tools = [{"name": "__strata_json_output", "description": "Return the requested structured answer.",
+                          "parameters": schema}]
+                forced_prefix = responses_api.forced_tool_prefix({"tool_choice": "required"}, tools)
+                kw = {**kw, "enable_thinking": False}
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # said once per tool, not per request
             if set(skipped) - noted:
                 print(f"[strata] /v1/responses: left out the hosted tools {', '.join(sorted(set(skipped) - noted))} "
@@ -3522,7 +3614,8 @@ def make_handler(svc: Service):
                 raise ResponsesError(str(e), "reasoning_budget_tokens") from None
             svc.load()
             try:
-                ids, thinking, max_new = svc.prepare(messages, tools, kw, req.get("max_output_tokens") or 0)
+                ids, thinking, max_new = svc.prepare(messages, tools, kw, req.get("max_output_tokens") or 0,
+                                                     forced_prefix=forced_prefix)
             except ResponsesError:
                 raise
             except ValueError as e:                          # too long for the context, an image without vision
@@ -3533,7 +3626,7 @@ def make_handler(svc: Service):
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None)
             # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
-            return ids, thinking, tools, max_new, asm, validator, req
+            return ids, thinking, tools, max_new, asm, validator, req, forced_prefix
 
         def _count_tokens(self, req):
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would

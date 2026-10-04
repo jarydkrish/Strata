@@ -715,7 +715,7 @@ are refused with an error that says so.
 | `input` as a string, or as items | `message` items (`user`, `assistant`, `system`, `developer`; text and images), `reasoning`, `function_call`, `function_call_output`, `custom_tool_call(_output)` |
 | `instructions` | The system message (with leading `developer` messages; later ones become user messages, as on the chat path) |
 | `tools` | `function` tools, `namespace` tools (the model sees `namespace.name`; calls come back with `namespace` and `name`), `custom` tools (one free-form `input` string). Hosted tools (`web_search`, `file_search`, ...) are left out: the model cannot run them |
-| `tool_choice` | `"none"` hides the tools; anything else lets the model choose (it cannot be forced) |
+| `tool_choice` | `"none"` hides tools; `"auto"` lets the model choose; `"required"` or a named function/custom tool prefills the call opening and validates the completed call before delivery |
 | `reasoning.effort` | `none`/`minimal`, `low`, `medium`, `high`/`xhigh`; without it the model's default (high) |
 | `max_output_tokens` | The output cap (thinking included). Running out ends the response `incomplete` (`max_output_tokens`) |
 | `text.format` | `json_schema` and `json_object` use the [JSON response formats](#json-response-formats) (checked, not constrained) |
@@ -1092,11 +1092,17 @@ times out, the server keeps ownership and reports an error rather than claiming 
 
 ### JSON response formats
 
+The fork's Responses `text.format` path prefills a private schema-bearing tool
+call, validates its model-generated arguments, then returns only the JSON
+object as message text. Internal tool events are never delivered. This skips
+free-form reasoning and buffers the answer until validation. The chat path
+below retains schema prompting and validation.
+
 `POST /v1/chat/completions` accepts `response_format: {"type":"json_object"}` or
 `{"type":"json_schema","json_schema":{"name":"answer","strict":true,"schema":{"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false}}}`.
 The schema must describe an object at its root. Local `#` references work; remote references are refused.
 `json_schema` is checked with the Python package `jsonschema` when it is installed (`python -m pip install
-"jsonschema>=4.23,<5"`; setup does not add it); without it the answer is only checked to be one JSON object, and the
+"jsonschema>=4.23,<5"`; new installs include it); without it the answer is only checked to be one JSON object, and the
 server says so once.
 
 This is **schema prompting followed by server validation**, not grammar-constrained decoding. One generation
