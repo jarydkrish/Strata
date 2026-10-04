@@ -65,7 +65,7 @@ Weights are Qwen3.8-Flash-Next IQ2_XS with int8 KV, a 32,768-token GPU-resident
 KV window and GPU vision. This differs from YakStack's dense 27B llama.cpp model.
 
 The local Responses, structured-output, parallel, server and security suites
-passed 207 tests. Three consecutive live API contract runs passed the required
+passed 207 tests initially and 208 after the boolean-parser fix. Three consecutive live API contract runs passed the required
 gates. Both the unpatched 128K server and patched 262K server, with reserve 2048,
 completed 80 short continuation requests across four conversations without an
 engine failure. The fork also completed 40 continuations across four roughly
@@ -80,9 +80,11 @@ available RAM never fell below 35.98 GiB. Sampling is not a guarantee against
 every transient allocation or arbitrary full-context workload.
 
 All 13 API/protocol probes passed in each of the three contract runs. The
-four domain smoke probes are separate: the retired-character exact-answer
-probe failed on both the fork and restored llama.cpp. A formatting-versus-
-semantic diagnostic is required before calling that a model quality regression.
+four domain smoke probes are separate: the retired-character probe failed
+semantically on both the fork and restored llama.cpp. Both answered `NO` without
+reasoning where the fixture expects `YES`; neither gave a classifiable answer
+in the 1,024-token high-reasoning diagnostic. This does not establish an
+IQ2-specific regression or broad model quality parity.
 
 Fixed 320-token output tests with 6.7K-token synthetic inputs, median of three
 repetitions, measured 59.19 aggregate end-to-end tokens/s for four cold requests
@@ -90,4 +92,16 @@ and 131.72 for four shared-prefix requests. The fresh llama.cpp control measured
 35.93 and 88.81 respectively. These include prefill/queueing and compare different
 models. The 40-request long-history soak took 414 seconds and some first-token
 waits exceeded 100 seconds; short-prompt throughput is not a general latency
-guarantee. Broad quality parity and permanent adoption remain separate decisions.
+guarantee. The same long-history soak passed on preserved llama.cpp in 322
+seconds, making Strata about 29% slower on that workload despite its short-input
+throughput advantage. Keep llama.cpp primary while evaluating representative
+application workflows and the forced-call reasoning tradeoff.
+
+The final boolean-parser source is `2b1114338d6a0b2c77425f3187953fbfb9aeb902`,
+image `sha256:c14984048e60f53d873eeb1184f23419b7b8e16221ce5aa5d56362d41f3dbaef`.
+It passed three further API contracts, 24 adversarial named/required tool probes,
+four multi-field JSON probes with both boolean values, and five live Ruby-client
+probes through YakStack's request builder, stream handler and response normalizer.
+The Ruby probes used an unsaved standard Responses compatibility configuration;
+they did not change application routing or write Message/ToolCall records.
+The engine and memory configuration are unchanged from the full stress run.
