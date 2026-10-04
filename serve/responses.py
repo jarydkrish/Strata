@@ -278,7 +278,66 @@ def request_tools(req: dict):
     choice = req.get("tool_choice")
     if choice == "none":
         return None, names, skipped
+    if choice not in (None, "auto", "required") and not isinstance(choice, dict):
+        raise ResponsesError("tool_choice must be auto, none, required or a named tool", "tool_choice")
+    if choice == "required" and not tools:
+        raise ResponsesError("required tool_choice needs a callable tool", "tool_choice")
+    if isinstance(choice, dict):
+        if choice.get("type") not in ("function", "custom"):
+            raise ResponsesError("named tool_choice must select a function or custom tool", "tool_choice")
+        selected = choice.get("name")
+        if not isinstance(selected, str) or not selected:
+            raise ResponsesError("named tool_choice needs a name", "tool_choice")
+        if choice.get("namespace"):
+            selected = f"{choice['namespace']}.{selected}"
+        if selected not in names or names[selected][2] != choice["type"]:
+            raise ResponsesError("tool_choice names an unavailable tool", "tool_choice")
+        tools = [t for t in tools if t["name"] == selected]
     return tools or None, names, skipped
+
+
+class ToolChoiceError(ValueError):
+    """A forced completion must never succeed as text or as an invalid tool call."""
+
+
+def forced_tool_prefix(req, tools):
+    choice = req.get("tool_choice")
+    if choice != "required" and not isinstance(choice, dict):
+        return ""
+    from serve.structured import jsonschema_modules, prepare_format
+    if jsonschema_modules() is None:
+        raise ResponsesError("forced tools require the jsonschema package", "tool_choice",
+                             "unsupported_parameter")
+    for tool in tools:
+        if any(c in tool["name"] for c in "<>\r\n"):
+            raise ResponsesError("tool name cannot be used in the tool-call prefix", "tool_choice")
+        try:
+            prepare_format({"type": "json_schema", "json_schema": {
+                "name": "forced_tool", "schema": tool.get("parameters") or {"type": "object"}}}, [])
+        except ValueError as e:
+            raise ResponsesError(str(e), "tools") from None
+    # Prefill the actual assistant continuation, rather than asking the model to
+    # ignore an adversarial user instruction. Required permits any supplied tool.
+    prefix = "<tool_call>\n<function="
+    if len(tools) == 1:
+        name = tools[0]["name"]
+        prefix += name + ">\n"
+    return prefix
+
+
+def validate_forced_tools(events, tools, finish):
+    from serve.structured import prepare_format
+    calls = [e.call for e in events if e.kind == "tool_call"]
+    if finish != "stop" or not calls or any(e.kind == "content" and e.text.strip() for e in events):
+        raise ToolChoiceError("forced tool generation did not complete a tool-only response")
+    schemas = {t["name"]: t.get("parameters") or {"type": "object"} for t in tools}
+    for call in calls:
+        if call.name not in schemas:
+            raise ToolChoiceError("forced tool generation selected an unavailable tool")
+        _, validator = prepare_format({"type": "json_schema", "json_schema": {
+            "name": "forced_tool", "schema": schemas[call.name]}}, [])
+        if next(validator.iter_errors(call.arguments), None) is not None:
+            raise ToolChoiceError("forced tool generation returned invalid arguments")
 
 
 def text_format(req: dict):

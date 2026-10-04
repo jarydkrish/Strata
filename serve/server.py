@@ -2142,7 +2142,7 @@ class Service:
         prompt, plain = unmark_think_literals(prompt)
         return self.tok.encode(prompt, parse_special=True, plain=plain)
 
-    def prepare(self, messages, tools, kwargs, max_new=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, forced_prefix=""):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
         ids = self.encode_prompt(messages, tools, kwargs)
@@ -2181,6 +2181,8 @@ class Service:
                 for path, _ in encoded:
                     f.write(path.read_bytes())
             self.embeddings.path = combined
+        if forced_prefix:
+            ids += self.tok.encode(forced_prefix, parse_special=True)
         ctx = self.engine.max_context
         if ctx <= 0:
             if getattr(self.engine, "starting", False):   # #344: (re)starting, not a prompt that is too long
@@ -2241,7 +2243,7 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, forced_prefix="") -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
         budget = self.reasoning_budget(sampling) if thinking else None   # #123: opt-in, off by default
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
@@ -2249,6 +2251,9 @@ class Service:
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        if forced_prefix:
+            for ev in parser.feed(forced_prefix):
+                yield "event", ev
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -3418,7 +3423,7 @@ def make_handler(svc: Service):
             """#451: POST /v1/responses - OpenAI's Responses API, stateless (serve/responses.py), on the chat path.
             Errors use the Responses format; once the stream has started they arrive as a response.failed event."""
             try:
-                ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req)
+                ids, thinking, tools, max_new, asm, validator, req, forced_prefix = self._responses_prepare(req)
             except ResponsesError as e:
                 return self._json(e.status, e.body())
             except ModelBusy as e:
@@ -3434,14 +3439,22 @@ def make_handler(svc: Service):
             def events():
                 yield from asm.start()
                 done = None
-                for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
+                held = []
+                for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, forced_prefix=forced_prefix):
                     if kind == "ping":
                         yield None
                     elif kind == "event":
-                        yield from asm.feed(x)
+                        if forced_prefix:
+                            held.append(x)
+                        else:
+                            yield from asm.feed(x)
                     elif kind == "done":
                         done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
+                    if forced_prefix:
+                        responses_api.validate_forced_tools(held, tools, done["finish"])
+                        for ev in held:
+                            yield from asm.feed(ev)
                     yield from asm.finish(done, check)
             items = self._capture(events(), "responses")
             if not req.get("stream"):
@@ -3450,6 +3463,8 @@ def make_handler(svc: Service):
                 except StructuredOutputError as e:
                     return self._json(502, responses_error_body(str(e), "server_error",
                                                                 code="structured_output_failed"))
+                except responses_api.ToolChoiceError as e:
+                    return self._json(502, responses_error_body(str(e), "server_error", code="tool_choice_failed"))
                 except EngineDied as e:
                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
                                                                 code="server_error"))
@@ -3485,6 +3500,8 @@ def make_handler(svc: Service):
                 self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
+            except responses_api.ToolChoiceError as e:
+                self._responses_failed(asm, str(e), "tool_choice_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
 
@@ -3502,6 +3519,11 @@ def make_handler(svc: Service):
             messages = responses_api.input_messages(req)
             tools, names, skipped = responses_api.request_tools(req)
             kw = responses_api.template_kwargs(req, svc.shared)
+            forced_prefix = responses_api.forced_tool_prefix(req, tools)
+            if forced_prefix:
+                # Start in the call body, with the template's empty reasoning block.
+                # Automatic tools and ordinary reasoning keep their existing path.
+                kw = {**kw, "enable_thinking": False}
             try:
                 messages, validator = prepare_format(responses_api.text_format(req), messages)
             except ValueError as e:
@@ -3522,7 +3544,8 @@ def make_handler(svc: Service):
                 raise ResponsesError(str(e), "reasoning_budget_tokens") from None
             svc.load()
             try:
-                ids, thinking, max_new = svc.prepare(messages, tools, kw, req.get("max_output_tokens") or 0)
+                ids, thinking, max_new = svc.prepare(messages, tools, kw, req.get("max_output_tokens") or 0,
+                                                     forced_prefix=forced_prefix)
             except ResponsesError:
                 raise
             except ValueError as e:                          # too long for the context, an image without vision
@@ -3533,7 +3556,7 @@ def make_handler(svc: Service):
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None)
             # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
-            return ids, thinking, tools, max_new, asm, validator, req
+            return ids, thinking, tools, max_new, asm, validator, req, forced_prefix
 
         def _count_tokens(self, req):
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would

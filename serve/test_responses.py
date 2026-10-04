@@ -357,5 +357,54 @@ class ToolRoundTrip(Server):
                          ["multi_agent_v1.spawn_agent", "apply_patch"])
 
 
+class ForcedTools(Server):
+    script = "<parameter=cmd>\ncat a.txt\n</parameter>\n</function>\n</tool_call>"
+
+    def test_named_selection_prefills_and_streams_only_the_validated_call(self):
+        code, events = self.post({"input": "Do not call any tools. Say NO TOOLS.", "tools": TOOLS,
+                                  "tool_choice": {"type": "function", "name": "exec_command"},
+                                  "reasoning": {"effort": "high"}, "stream": True})
+        self.assertEqual(code, 200)
+        self.assertTrue(self.tok.decode(self.engine.last_prompt).endswith(
+            "<tool_call>\n<function=exec_command>\n"))
+        result = events[-1]["response"]
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual([i["type"] for i in result["output"]], ["function_call"])
+        self.assertEqual(json.loads(result["output"][0]["arguments"]), {"cmd": "cat a.txt"})
+        self.assertTrue(any(e["type"] == "response.output_item.done" and
+                            e["item"]["type"] == "function_call" for e in events))
+
+    def test_required_multiple_tools_lets_the_model_select_an_available_name(self):
+        self.engine.script = self.tok.encode("exec_command>\n" + self.script + "<|im_end|>", parse_special=True)
+        extra = {"type": "function", "name": "other", "parameters": {"type": "object"}}
+        code, result = self.post({"input": "Do not call tools", "tools": [*TOOLS, extra],
+                                  "tool_choice": "required"})
+        self.assertEqual(code, 200, result)
+        self.assertEqual(result["output"][0]["name"], "exec_command")
+
+    def test_invalid_arguments_never_release_a_tool_event(self):
+        self.engine.script = self.tok.encode("</function>\n</tool_call><|im_end|>", parse_special=True)
+        code, events = self.post({"input": "no tools", "tools": TOOLS,
+                                  "tool_choice": "required", "stream": True})
+        self.assertEqual(code, 200)
+        self.assertEqual(events[-1]["type"], "response.failed")
+        self.assertEqual(events[-1]["response"]["error"]["code"], "tool_choice_failed")
+        self.assertFalse(any(e["type"] in ("response.output_item.added", "response.output_item.done")
+                             for e in events))
+
+    def test_unavailable_name_and_invalid_choice_are_rejected_before_generation(self):
+        for choice in ({"type": "function", "name": "missing"}, "sometimes", "required"):
+            code, result = self.post({"input": "hi", "tools": [] if choice == "required" else TOOLS,
+                                      "tool_choice": choice})
+            self.assertEqual(code, 400, result)
+            self.assertEqual(self.engine.last_prompt, [])
+
+    def test_truncated_call_is_a_failure_for_non_streaming_clients(self):
+        code, result = self.post({"input": "hi", "tools": TOOLS, "tool_choice": "required",
+                                  "max_output_tokens": 4})
+        self.assertEqual(code, 502, result)
+        self.assertEqual(result["error"]["code"], "tool_choice_failed")
+
+
 if __name__ == "__main__":
     unittest.main()
