@@ -51,7 +51,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+from serve.frontend import (ChatTemplate, Event, OutputParser, ToolParseError, anthropic_to_messages,  # noqa: E402
                             images_of, mark_think_literals, openai_to_messages, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
@@ -2250,7 +2250,7 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, strict_tools=bool(forced_prefix))
         if forced_prefix:
             for ev in parser.feed(forced_prefix):
                 yield "event", ev
@@ -2337,6 +2337,9 @@ class Service:
                         except EngineDied as e:
                             finish = "error"
                             self._say_died(e)
+                            raise
+                        except ToolParseError:
+                            finish = "error"
                             raise
                         except ValueError as e:             # the engine's ERR line (it may have ended after it)
                             finish = "error"
@@ -3440,7 +3443,14 @@ def make_handler(svc: Service):
                 yield from asm.start()
                 done = None
                 held = []
-                for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, forced_prefix=forced_prefix):
+                def generation():
+                    try:
+                        yield from svc.run(ids, thinking, tools, max_new, req, cancel, forced_prefix=forced_prefix)
+                    except ToolParseError:
+                        if validator is not None:
+                            raise StructuredOutputError("structured generation returned a malformed call") from None
+                        raise responses_api.ToolChoiceError("forced generation returned a malformed call") from None
+                for kind, x in generation():
                     if kind == "ping":
                         yield None
                     elif kind == "event":
@@ -3452,9 +3462,21 @@ def make_handler(svc: Service):
                         done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
                     if forced_prefix:
-                        responses_api.validate_forced_tools(held, tools, done["finish"])
-                        for ev in held:
-                            yield from asm.feed(ev)
+                        try:
+                            responses_api.validate_forced_tools(held, tools, done["finish"])
+                        except responses_api.ToolChoiceError as e:
+                            if validator is not None:
+                                raise StructuredOutputError(str(e)) from None
+                            raise
+                        if validator is not None:
+                            calls = [e.call for e in held if e.kind == "tool_call"]
+                            if len(calls) != 1:
+                                raise StructuredOutputError("structured generation needs exactly one object")
+                            text = json.dumps(calls[0].arguments, ensure_ascii=False, allow_nan=False)
+                            yield from asm.feed(Event("content", text))
+                        else:
+                            for ev in held:
+                                yield from asm.feed(ev)
                     yield from asm.finish(done, check)
             items = self._capture(events(), "responses")
             if not req.get("stream"):
@@ -3531,6 +3553,13 @@ def make_handler(svc: Service):
             if validator is not None and tools:
                 raise ResponsesError("a JSON text.format with tools is not supported", "text.format",
                                      "unsupported_parameter")
+            if validator is not None:
+                fmt = responses_api.text_format(req)
+                schema = fmt["json_schema"]["schema"] if fmt["type"] == "json_schema" else {"type": "object"}
+                tools = [{"name": "__strata_json_output", "description": "Return the requested structured answer.",
+                          "parameters": schema}]
+                forced_prefix = responses_api.forced_tool_prefix({"tool_choice": "required"}, tools)
+                kw = {**kw, "enable_thinking": False}
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # said once per tool, not per request
             if set(skipped) - noted:
                 print(f"[strata] /v1/responses: left out the hosted tools {', '.join(sorted(set(skipped) - noted))} "

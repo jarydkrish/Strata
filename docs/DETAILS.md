@@ -1092,6 +1092,12 @@ times out, the server keeps ownership and reports an error rather than claiming 
 
 ### JSON response formats
 
+The fork's Responses `text.format` path prefills a private schema-bearing tool
+call, validates its model-generated arguments, then returns only the JSON
+object as message text. Internal tool events are never delivered. This skips
+free-form reasoning and buffers the answer until validation. The chat path
+below retains schema prompting and validation.
+
 `POST /v1/chat/completions` accepts `response_format: {"type":"json_object"}` or
 `{"type":"json_schema","json_schema":{"name":"answer","strict":true,"schema":{"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false}}}`.
 The schema must describe an object at its root. Local `#` references work; remote references are refused.

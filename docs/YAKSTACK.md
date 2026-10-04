@@ -24,6 +24,13 @@ and ordinary reasoning keep their existing streaming path. `jsonschema` is
 now included in the install requirements. An older install missing it rejects
 forced selection rather than silently weakening validation.
 
+Responses `text.format` uses this path with a private schema-bearing tool.
+After validation, its model-generated argument object becomes the JSON text
+message; the internal tool never appears in client events. Schema prompting
+alone failed the conflicting-instruction probe on the real model. This route
+still has no general grammar decoder or hidden retry, and can fail explicitly
+on invalid or incomplete generation. It also skips free-form reasoning.
+
 ## Four-slot memory boundary
 
 The original 700 MiB reserve ran out of VRAM while instantiating a verify

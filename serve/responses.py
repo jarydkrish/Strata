@@ -336,8 +336,31 @@ def validate_forced_tools(events, tools, finish):
             raise ToolChoiceError("forced tool generation selected an unavailable tool")
         _, validator = prepare_format({"type": "json_schema", "json_schema": {
             "name": "forced_tool", "schema": schemas[call.name]}}, [])
-        if next(validator.iter_errors(call.arguments), None) is not None:
+        try:
+            invalid = next(validator.iter_errors(call.arguments), None) is not None
+        except Exception:
+            raise ToolChoiceError("forced tool argument schema could not be evaluated") from None
+        if invalid:
             raise ToolChoiceError("forced tool generation returned invalid arguments")
+        # Check the streamed argument spelling as well as the final parsed object:
+        # repeated keys must not silently become last-value-wins tool arguments.
+        raw = "".join(e.text for e in events if e.kind == "tool_args" and e.call.id == call.id)
+        def pairs(items):
+            obj = {}
+            for key, value in items:
+                if key in obj:
+                    raise ValueError("duplicate argument")
+                obj[key] = value
+            return obj
+        def constant(value):
+            raise ValueError("non-finite argument")
+        try:
+            parsed = json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+            if parsed != call.arguments:
+                raise ValueError("argument views differ")
+            json.dumps(call.arguments, allow_nan=False)
+        except (ValueError, TypeError):
+            raise ToolChoiceError("forced tool generation returned malformed arguments") from None
 
 
 def text_format(req: dict):

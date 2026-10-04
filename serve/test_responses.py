@@ -265,18 +265,22 @@ class OverHttp(Server):
         self.assertEqual(code, 403)
 
     def test_json_schema_text_format(self):
-        self.engine.scripts = [self.tok.encode("</think>\n\n{\"n\": 3}<|im_end|>", parse_special=True)]
+        self.engine.scripts = [self.tok.encode("<parameter=n>\n3\n</parameter>\n</function>\n</tool_call>"
+                                             "<|im_end|>", parse_special=True)]
         self.engine.script = self.engine.scripts[0]
         fmt = {"type": "json_schema", "name": "num", "strict": True,
                "schema": {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}}
         code, r = self.post({"model": "m", "input": "a number", "text": {"format": fmt}})
         self.assertEqual(code, 200, r)
         self.assertEqual(r["output"][-1]["content"][0]["text"], "{\"n\":3}")
+        self.assertEqual([item["type"] for item in r["output"]], ["message"])
+        self.assertTrue(self.tok.decode(self.engine.last_prompt).endswith(
+            "<tool_call>\n<function=__strata_json_output>\n"))
         code, events = self.post({"model": "m", "input": "a number", "text": {"format": fmt}, "stream": True})
         self.assertEqual([e["delta"] for e in events if e["type"] == "response.output_text.delta"], ["{\"n\":3}"])
         self.assertEqual(events[-1]["type"], "response.completed")
         # an answer that fails the schema
-        bad = {**fmt, "schema": {**fmt["schema"], "properties": {"n": {"type": "string"}}}}
+        bad = {**fmt, "schema": {**fmt["schema"], "properties": {"n": {"type": "integer", "enum": [4]}}}}
         code, r = self.post({"model": "m", "input": "a number", "text": {"format": bad}})
         self.assertEqual((code, r["error"]["code"]), (502, "structured_output_failed"))
         code, events = self.post({"model": "m", "input": "a number", "text": {"format": bad}, "stream": True})
@@ -392,6 +396,14 @@ class ForcedTools(Server):
         self.assertFalse(any(e["type"] in ("response.output_item.added", "response.output_item.done")
                              for e in events))
 
+    def test_repeated_argument_keys_do_not_become_last_value_wins(self):
+        repeated = ("<parameter=cmd>\nfirst\n</parameter>\n<parameter=cmd>\nsecond\n</parameter>\n"
+                    "</function>\n</tool_call><|im_end|>")
+        self.engine.script = self.tok.encode(repeated, parse_special=True)
+        code, result = self.post({"input": "hi", "tools": TOOLS, "tool_choice": "required"})
+        self.assertEqual(code, 502, result)
+        self.assertEqual(result["error"]["code"], "tool_choice_failed")
+
     def test_unavailable_name_and_invalid_choice_are_rejected_before_generation(self):
         for choice in ({"type": "function", "name": "missing"}, "sometimes", "required"):
             code, result = self.post({"input": "hi", "tools": [] if choice == "required" else TOOLS,
@@ -402,6 +414,22 @@ class ForcedTools(Server):
     def test_truncated_call_is_a_failure_for_non_streaming_clients(self):
         code, result = self.post({"input": "hi", "tools": TOOLS, "tool_choice": "required",
                                   "max_output_tokens": 4})
+        self.assertEqual(code, 502, result)
+        self.assertEqual(result["error"]["code"], "tool_choice_failed")
+
+    def test_missing_function_end_is_not_repaired(self):
+        self.engine.script = self.tok.encode("<parameter=cmd>\nhi\n</parameter>\n</tool_call>"
+                                             "<|im_end|>", parse_special=True)
+        code, result = self.post({"input": "hi", "tools": TOOLS, "tool_choice": "required"})
+        self.assertEqual(code, 502, result)
+        self.assertEqual(result["error"]["code"], "tool_choice_failed")
+
+    def test_nested_duplicate_json_keys_are_rejected(self):
+        tool = {"type": "function", "name": "store", "parameters": {
+            "type": "object", "properties": {"payload": {"type": "object"}}, "required": ["payload"]}}
+        self.engine.script = self.tok.encode('<parameter=payload>\n{"x":1,"x":2}\n</parameter>\n'
+                                             '</function>\n</tool_call><|im_end|>', parse_special=True)
+        code, result = self.post({"input": "hi", "tools": [tool], "tool_choice": "required"})
         self.assertEqual(code, 502, result)
         self.assertEqual(result["error"]["code"], "tool_choice_failed")
 
