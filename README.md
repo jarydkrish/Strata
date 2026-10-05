@@ -165,6 +165,8 @@ Forced tool arguments are checked against their JSON schema. A rejected call ret
 `tool_choice_failed`; schema failures include bounded `diagnostics.validation_rule`
 and `diagnostics.schema_path` in HTTP errors and streamed failures. The server logs
 these schema coordinates without the generated arguments or validation message.
+For a `required` failure, `diagnostics.missing_fields` names the missing schema
+properties so a client can issue a specific correction without seeing argument values.
 
 ## Something went wrong?
 
