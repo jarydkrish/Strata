@@ -454,6 +454,22 @@ class ForcedTools(Server):
                 "validation_rule": "maxItems", "schema_path": ["properties", "payload", "maxItems"]})
             self.assertNotIn("PRIVATE", json.dumps(error))
 
+    def test_required_diagnostics_name_only_missing_schema_fields(self):
+        tool = {"type": "function", "name": "store", "parameters": {
+            "type": "object", "properties": {"payload": {"type": "object",
+                "properties": {"name": {"type": "string"}, "reason": {"type": ["string", "null"]}},
+                "required": ["name", "reason"]}}, "required": ["payload"]}}
+        self.engine.script = self.tok.encode(
+            '<parameter=payload>\n{"name":"PRIVATE OUTPUT"}\n</parameter>\n'
+            '</function>\n</tool_call><|im_end|>', parse_special=True)
+        for streaming in (False, True):
+            _, result = self.post({"input": "PRIVATE PROMPT", "tools": [tool],
+                                   "tool_choice": "required", "stream": streaming})
+            error = result[-1]["response"]["error"] if streaming else result["error"]
+            self.assertEqual(error["diagnostics"], {"validation_rule": "required",
+                "schema_path": ["properties", "payload", "required"], "missing_fields": ["reason"]})
+            self.assertNotIn("PRIVATE", json.dumps(error))
+
     def test_missing_function_end_is_not_repaired(self):
         self.engine.script = self.tok.encode("<parameter=cmd>\nhi\n</parameter>\n</tool_call>"
                                              "<|im_end|>", parse_special=True)

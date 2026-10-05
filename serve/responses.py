@@ -348,8 +348,11 @@ def validate_forced_tools(events, tools, finish):
             # Schema coordinates only; never expose generated arguments,
             # jsonschema's message, or enum values.
             path = [x if isinstance(x, int) else str(x)[:64] for x in failure.absolute_schema_path]
-            raise ToolChoiceError("forced tool generation returned invalid arguments", {
-                "validation_rule": str(failure.validator)[:64], "schema_path": path[:24]})
+            diagnostics = {"validation_rule": str(failure.validator)[:64], "schema_path": path[:24]}
+            if failure.validator == "required" and isinstance(failure.instance, dict):
+                diagnostics["missing_fields"] = [str(k)[:64] for k in failure.validator_value
+                                                 if k not in failure.instance][:32]
+            raise ToolChoiceError("forced tool generation returned invalid arguments", diagnostics)
         # Check the streamed argument spelling as well as the final parsed object:
         # repeated keys must not silently become last-value-wins tool arguments.
         raw = "".join(e.text for e in events if e.kind == "tool_args" and e.call.id == call.id)
