@@ -438,6 +438,22 @@ class ForcedTools(Server):
         self.assertEqual(code, 502, result)
         self.assertEqual(result["error"]["code"], "tool_choice_failed")
 
+    def test_schema_diagnostics_do_not_expose_generated_values(self):
+        tool = {"type": "function", "name": "store", "parameters": {
+            "type": "object", "properties": {"payload": {"type": "array", "maxItems": 1,
+                "items": {"type": "string"}}}, "required": ["payload"]}}
+        self.engine.script = self.tok.encode(
+            '<parameter=payload>\n["PRIVATE OUTPUT ONE","PRIVATE OUTPUT TWO"]\n</parameter>\n'
+            '</function>\n</tool_call><|im_end|>', parse_special=True)
+        for streaming in (False, True):
+            code, result = self.post({"input": "PRIVATE PROMPT", "tools": [tool],
+                                      "tool_choice": "required", "stream": streaming})
+            error = result[-1]["response"]["error"] if streaming else result["error"]
+            self.assertEqual(code, 200 if streaming else 502)
+            self.assertEqual(error["diagnostics"], {
+                "validation_rule": "maxItems", "schema_path": ["properties", "payload", "maxItems"]})
+            self.assertNotIn("PRIVATE", json.dumps(error))
+
     def test_missing_function_end_is_not_repaired(self):
         self.engine.script = self.tok.encode("<parameter=cmd>\nhi\n</parameter>\n</tool_call>"
                                              "<|im_end|>", parse_special=True)

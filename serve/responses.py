@@ -299,6 +299,10 @@ def request_tools(req: dict):
 class ToolChoiceError(ValueError):
     """A forced completion must never succeed as text or as an invalid tool call."""
 
+    def __init__(self, message, diagnostics=None):
+        super().__init__(message)
+        self.diagnostics = diagnostics or {}
+
 
 def forced_tool_prefix(req, tools):
     choice = req.get("tool_choice")
@@ -337,11 +341,15 @@ def validate_forced_tools(events, tools, finish):
         _, validator = prepare_format({"type": "json_schema", "json_schema": {
             "name": "forced_tool", "schema": schemas[call.name]}}, [])
         try:
-            invalid = next(validator.iter_errors(call.arguments), None) is not None
+            failure = next(validator.iter_errors(call.arguments), None)
         except Exception:
             raise ToolChoiceError("forced tool argument schema could not be evaluated") from None
-        if invalid:
-            raise ToolChoiceError("forced tool generation returned invalid arguments")
+        if failure is not None:
+            # Schema coordinates only; never expose generated arguments,
+            # jsonschema's message, or enum values.
+            path = [x if isinstance(x, int) else str(x)[:64] for x in failure.absolute_schema_path]
+            raise ToolChoiceError("forced tool generation returned invalid arguments", {
+                "validation_rule": str(failure.validator)[:64], "schema_path": path[:24]})
         # Check the streamed argument spelling as well as the final parsed object:
         # repeated keys must not silently become last-value-wins tool arguments.
         raw = "".join(e.text for e in events if e.kind == "tool_args" and e.call.id == call.id)

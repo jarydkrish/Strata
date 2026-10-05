@@ -161,6 +161,11 @@ Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add a
 
 More: [where your chats are stored](docs/INSTALL.md#where-things-are-stored), [the API](docs/DETAILS.md#using-it).
 
+Forced tool arguments are checked against their JSON schema. A rejected call returns
+`tool_choice_failed`; schema failures include bounded `diagnostics.validation_rule`
+and `diagnostics.schema_path` in HTTP errors and streamed failures. The server logs
+these schema coordinates without the generated arguments or validation message.
+
 ## Something went wrong?
 
 - **My PC froze the first time Strata started.** This is normal while it loads the model. Wait, and don't close the

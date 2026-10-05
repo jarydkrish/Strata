@@ -3527,7 +3527,11 @@ def make_handler(svc: Service):
                     return self._json(502, responses_error_body(str(e), "server_error",
                                                                 code="structured_output_failed"))
                 except responses_api.ToolChoiceError as e:
-                    return self._json(502, responses_error_body(str(e), "server_error", code="tool_choice_failed"))
+                    body = responses_error_body(str(e), "server_error", code="tool_choice_failed")
+                    body["error"]["diagnostics"] = e.diagnostics
+                    if e.diagnostics:
+                        print("[strata] forced tool validation: " + json.dumps(e.diagnostics), file=sys.stderr, flush=True)
+                    return self._json(502, body)
                 except EngineDied as e:
                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
                                                                 code="server_error"))
@@ -3564,12 +3568,15 @@ def make_handler(svc: Service):
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
             except responses_api.ToolChoiceError as e:
-                self._responses_failed(asm, str(e), "tool_choice_failed", send)
+                self._responses_failed(asm, str(e), "tool_choice_failed", send, e.diagnostics)
             except ValueError as e:                          # the engine's ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
 
-        def _responses_failed(self, asm, message, code, send):
+        def _responses_failed(self, asm, message, code, send, diagnostics=None):
             e = asm.failed(message, code)
+            if diagnostics:
+                e["response"]["error"]["diagnostics"] = diagnostics
+                print("[strata] forced tool validation: " + json.dumps(diagnostics), file=sys.stderr, flush=True)
             self._note(error=e["response"]["error"])
             try:
                 send(e)
