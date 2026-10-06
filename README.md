@@ -168,6 +168,14 @@ these schema coordinates without the generated arguments or validation message.
 For a `required` failure, `diagnostics.missing_fields` names the missing schema
 properties so a client can issue a specific correction without seeing argument values.
 
+HTTP and streamed Responses errors also include request-local `error.retry_feedback`
+for schema failures: the validation message, instance path, tool name when applicable,
+and a rejected-output excerpt. Messages are capped at 2,000 characters and output
+excerpts at 12,000. This feedback can contain private generated values. Use it only
+in the client's correction conversation; exclude it from logs, traces and metrics.
+The ordinary error message and `diagnostics` remain safe for telemetry. Structured
+JSON failures preserve the same diagnostics and feedback as forced-tool failures.
+
 ## Something went wrong?
 
 - **My PC froze the first time Strata started.** This is normal while it loads the model. Wait, and don't close the

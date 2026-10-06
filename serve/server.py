@@ -3507,7 +3507,7 @@ def make_handler(svc: Service):
                             responses_api.validate_forced_tools(held, tools, done["finish"])
                         except responses_api.ToolChoiceError as e:
                             if validator is not None:
-                                raise StructuredOutputError(str(e)) from None
+                                raise StructuredOutputError(str(e), e.diagnostics, e.retry_feedback) from None
                             raise
                         if validator is not None:
                             calls = [e.call for e in held if e.kind == "tool_call"]
@@ -3524,11 +3524,13 @@ def make_handler(svc: Service):
                 try:
                     result = responses_api.collect(items)
                 except StructuredOutputError as e:
-                    return self._json(502, responses_error_body(str(e), "server_error",
-                                                                code="structured_output_failed"))
+                    body = responses_error_body(str(e), "server_error", code="structured_output_failed")
+                    body["error"].update(diagnostics=e.diagnostics, retry_feedback=e.retry_feedback)
+                    return self._json(502, body)
                 except responses_api.ToolChoiceError as e:
                     body = responses_error_body(str(e), "server_error", code="tool_choice_failed")
                     body["error"]["diagnostics"] = e.diagnostics
+                    body["error"]["retry_feedback"] = e.retry_feedback
                     if e.diagnostics:
                         print("[strata] forced tool validation: " + json.dumps(e.diagnostics), file=sys.stderr, flush=True)
                     return self._json(502, body)
@@ -3566,18 +3568,20 @@ def make_handler(svc: Service):
             except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
                 self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
             except StructuredOutputError as e:
-                self._responses_failed(asm, str(e), "structured_output_failed", send)
+                self._responses_failed(asm, str(e), "structured_output_failed", send, e.diagnostics, e.retry_feedback)
             except responses_api.ToolChoiceError as e:
-                self._responses_failed(asm, str(e), "tool_choice_failed", send, e.diagnostics)
+                self._responses_failed(asm, str(e), "tool_choice_failed", send, e.diagnostics, e.retry_feedback)
             except ValueError as e:                          # the engine's ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
 
-        def _responses_failed(self, asm, message, code, send, diagnostics=None):
+        def _responses_failed(self, asm, message, code, send, diagnostics=None, retry_feedback=None):
             e = asm.failed(message, code)
             if diagnostics:
                 e["response"]["error"]["diagnostics"] = diagnostics
                 print("[strata] forced tool validation: " + json.dumps(diagnostics), file=sys.stderr, flush=True)
-            self._note(error=e["response"]["error"])
+            self._note(error=dict(e["response"]["error"]))
+            if retry_feedback:
+                e["response"]["error"]["retry_feedback"] = retry_feedback
             try:
                 send(e)
                 self.wfile.flush()

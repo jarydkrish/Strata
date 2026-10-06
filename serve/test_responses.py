@@ -283,9 +283,13 @@ class OverHttp(Server):
         bad = {**fmt, "schema": {**fmt["schema"], "properties": {"n": {"type": "integer", "enum": [4]}}}}
         code, r = self.post({"model": "m", "input": "a number", "text": {"format": bad}})
         self.assertEqual((code, r["error"]["code"]), (502, "structured_output_failed"))
+        self.assertEqual(r["error"]["diagnostics"]["validation_rule"], "enum")
+        self.assertEqual(r["error"]["retry_feedback"]["instance_path"], ["n"])
+        self.assertIn("4", r["error"]["retry_feedback"]["message"])
         code, events = self.post({"model": "m", "input": "a number", "text": {"format": bad}, "stream": True})
         self.assertEqual(events[-1]["type"], "response.failed")
         self.assertEqual(events[-1]["response"]["error"]["code"], "structured_output_failed")
+        self.assertEqual(events[-1]["response"]["error"]["retry_feedback"], r["error"]["retry_feedback"])
 
     def test_monitor_and_status(self):
         self.svc.api_monitor = True
@@ -452,7 +456,8 @@ class ForcedTools(Server):
             self.assertEqual(code, 200 if streaming else 502)
             self.assertEqual(error["diagnostics"], {
                 "validation_rule": "maxItems", "schema_path": ["properties", "payload", "maxItems"]})
-            self.assertNotIn("PRIVATE", json.dumps(error))
+            self.assertNotIn("PRIVATE", json.dumps({k: v for k, v in error.items() if k != "retry_feedback"}))
+            self.assertIn("PRIVATE OUTPUT", error["retry_feedback"]["rejected_output"])
 
     def test_required_diagnostics_name_only_missing_schema_fields(self):
         tool = {"type": "function", "name": "store", "parameters": {
@@ -468,7 +473,8 @@ class ForcedTools(Server):
             error = result[-1]["response"]["error"] if streaming else result["error"]
             self.assertEqual(error["diagnostics"], {"validation_rule": "required",
                 "schema_path": ["properties", "payload", "required"], "missing_fields": ["reason"]})
-            self.assertNotIn("PRIVATE", json.dumps(error))
+            self.assertNotIn("PRIVATE", json.dumps({k: v for k, v in error.items() if k != "retry_feedback"}))
+            self.assertIn("PRIVATE OUTPUT", error["retry_feedback"]["rejected_output"])
 
     def test_missing_function_end_is_not_repaired(self):
         self.engine.script = self.tok.encode("<parameter=cmd>\nhi\n</parameter>\n</tool_call>"

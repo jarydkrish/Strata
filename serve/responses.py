@@ -299,9 +299,10 @@ def request_tools(req: dict):
 class ToolChoiceError(ValueError):
     """A forced completion must never succeed as text or as an invalid tool call."""
 
-    def __init__(self, message, diagnostics=None):
+    def __init__(self, message, diagnostics=None, retry_feedback=None):
         super().__init__(message)
         self.diagnostics = diagnostics or {}
+        self.retry_feedback = retry_feedback or {}
 
 
 def forced_tool_prefix(req, tools):
@@ -330,7 +331,7 @@ def forced_tool_prefix(req, tools):
 
 
 def validate_forced_tools(events, tools, finish):
-    from serve.structured import prepare_format
+    from serve.structured import prepare_format, validation_feedback
     calls = [e.call for e in events if e.kind == "tool_call"]
     if finish != "stop" or not calls or any(e.kind == "content" and e.text.strip() for e in events):
         raise ToolChoiceError("forced tool generation did not complete a tool-only response")
@@ -352,7 +353,9 @@ def validate_forced_tools(events, tools, finish):
             if failure.validator == "required" and isinstance(failure.instance, dict):
                 diagnostics["missing_fields"] = [str(k)[:64] for k in failure.validator_value
                                                  if k not in failure.instance][:32]
-            raise ToolChoiceError("forced tool generation returned invalid arguments", diagnostics)
+            feedback = validation_feedback(failure, call.arguments)
+            feedback["tool_name"] = call.name
+            raise ToolChoiceError("forced tool generation returned invalid arguments", diagnostics, feedback)
         # Check the streamed argument spelling as well as the final parsed object:
         # repeated keys must not silently become last-value-wins tool arguments.
         raw = "".join(e.text for e in events if e.kind == "tool_args" and e.call.id == call.id)
