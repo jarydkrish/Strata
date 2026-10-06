@@ -428,22 +428,43 @@ def call_end(text: str) -> int:
             return text.find(CALL_END, pos)
 
 
-def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
+class ToolParseError(ValueError):
+    pass
+
+
+def parse_tool_call(body: str, schema: dict | None = None, strict=False) -> ToolCall:
     """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` -> ToolCall. Values are JSON-decoded
     when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
     objects/arrays/numbers/booleans)."""
     body = body.strip()
+    if strict and not body.endswith("</function>"):
+        raise ToolParseError("forced tool call is missing its function end")
     if not body.startswith("<function=") or ">" not in body:
         raise ValueError("malformed tool call: " + body[:80])
     name = body[len("<function="):body.index(">")]
     rest = body[body.index(">") + 1:]
     props = ((schema or {}).get("parameters") or {}).get("properties") or {}
     args = {}
+    def pairs(items):
+        obj = {}
+        for key, value in items:
+            if key in obj:
+                raise ToolParseError("forced tool call has duplicate JSON keys")
+            obj[key] = value
+        return obj
+    def constant(value):
+        raise ToolParseError("forced tool call has non-finite JSON")
     while "<parameter=" in rest:
+        if strict and not rest.lstrip().startswith("<parameter="):
+            raise ToolParseError("forced tool call has text outside its parameters")
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
         pname = rest[:rest.index(">")]
+        if strict and pname in args:
+            raise ToolParseError("forced tool call has duplicate parameters")
         rest = rest[rest.index(">") + 1:]
         end = param_end(rest, final=True)
+        if strict and end < 0:
+            raise ToolParseError("forced tool call has an incomplete parameter")
         value = rest[:end] if end >= 0 else rest
         rest = rest[end + len(PARAM_END):] if end >= 0 else ""
         if value.startswith("\n"):
@@ -455,9 +476,16 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
             args[pname] = value
         else:
             try:
-                args[pname] = json.loads(value)
+                args[pname] = json.loads(value, object_pairs_hook=pairs, parse_constant=constant) if strict else json.loads(value)
+            except ToolParseError:
+                raise
             except ValueError:
-                args[pname] = value
+                # Qwen's native XML dialect also spells scalar booleans as
+                # Python literals. Only a declared boolean permits these;
+                # strings and malformed JSON objects are never coerced.
+                args[pname] = value == "True" if declared == "boolean" and value in ("True", "False") else value
+    if strict and rest.strip() != "</function>":
+        raise ToolParseError("forced tool call has trailing text")
     return ToolCall(name=name, arguments=args)
 
 
@@ -465,7 +493,8 @@ class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
-    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False):
+    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
+                 strict_tools: bool = False):
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
@@ -475,6 +504,7 @@ class OutputParser:
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
         # nothing until the call is complete, which for a large file write can be many minutes.
         self.stream_tools = stream_tools
+        self.strict_tools = strict_tools
         self._reset_scan()
 
     def _reset_scan(self):
@@ -484,6 +514,7 @@ class OutputParser:
         self.sfirst = True
         self.sval_started = False
         self.sdeclared = {}
+        self.sparam = None
 
     def _scan(self) -> list[Event]:
         """Advance the streaming view of the call body in self.buf (see stream_tools)."""
@@ -515,6 +546,7 @@ class OutputParser:
                     if b < 0:
                         return out
                     pname = stripped[11:b]
+                    self.sparam = pname
                     args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
                     self.sfirst = False
                     self.sp += b + 1
@@ -566,7 +598,7 @@ class OutputParser:
                 try:
                     v = json.loads(value)
                 except ValueError:
-                    v = value
+                    v = value == "True" if self.sdeclared.get(self.sparam) == "boolean" and value in ("True", "False") else value
                 args(json.dumps(v, ensure_ascii=False))
                 self.sp += end + len(PARAM_END)
                 self.ss = "between"
@@ -650,7 +682,7 @@ class OutputParser:
                 body = self.buf[:i]
                 self.buf = self.buf[i + len(CALL_END):]
                 name = body.strip()[len("<function="):].split(">", 1)[0]
-                call = parse_tool_call(body, self.schemas.get(name))
+                call = parse_tool_call(body, self.schemas.get(name), strict=self.strict_tools)
                 if self.scall is not None:
                     call.id = self.scall.id
                 out.append(Event("tool_call", call=call))

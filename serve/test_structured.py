@@ -41,6 +41,17 @@ FORMAT = {"type": "json_schema", "json_schema": {"name": "h3_story", "strict": T
 
 
 class Structured(unittest.TestCase):
+    def test_retry_feedback_is_bounded_and_the_exception_message_is_safe(self):
+        _, validator = structured.prepare_format({"type": "json_schema", "json_schema": {
+            "name": "bounded", "schema": {"type": "object", "properties": {"n": {"type": "integer"}}}}}, [])
+        with self.assertRaises(structured.StructuredOutputError) as raised:
+            structured.validated_json(json.dumps({"n": "PRIVATE" * 4000}), validator, "stop")
+        error = raised.exception
+        self.assertNotIn("PRIVATE", str(error))
+        self.assertEqual(error.retry_feedback["instance_path"], ["n"])
+        self.assertEqual(len(error.retry_feedback["message"]), 2000)
+        self.assertEqual(len(error.retry_feedback["rejected_output"]), 12000)
+
     def request(self, path, body=None, headers=None):
         req = urllib.request.Request(self.base + path, data=json.dumps(body).encode() if body is not None else None,
                                      headers={"Content-Type": "application/json", **(headers or {})})
