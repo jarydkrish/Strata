@@ -91,6 +91,10 @@ about 10-25% speed per request on this card". `--parallel N` is honoured as aske
 - Slots are assigned so that consecutive requests land in different pipeline groups (`--batch-groups`).
 - A client that disconnects stops its slot (`BSTOP`); the others go on.
 
+Request timings combine the prompt reads and decoding across solo/batch handoffs. Cached input counts only the
+prefix reused when the request first started: promoting a request into a slot must not count the history it just
+read as a cache hit from an earlier request. The `DONE` lines remain per engine segment.
+
 ## Exactness
 
 A batch row's arithmetic is the single-token window's, so with greedy decoding **every conversation of a batch

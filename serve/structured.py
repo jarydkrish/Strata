@@ -12,7 +12,17 @@ import threading
 
 
 class StructuredOutputError(RuntimeError):
-    pass
+    def __init__(self, message, diagnostics=None, retry_feedback=None):
+        super().__init__(message)
+        self.diagnostics = diagnostics or {}
+        self.retry_feedback = retry_feedback or {}
+
+
+def validation_feedback(error, output):
+    """Request-local correction data. Never put this in logs or telemetry."""
+    return {"message": error.message[:2000],
+            "instance_path": list(error.absolute_path)[:24],
+            "rejected_output": json.dumps(output, ensure_ascii=False, default=str)[:12000]}
 
 
 class _ObjectOnly:
@@ -203,12 +213,15 @@ def validated_json(text, validator, finish):
         value = json.loads(_extract_json(text), object_pairs_hook=pairs, parse_constant=constant)
         canonical = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     except (ValueError, TypeError) as exc:
-        raise StructuredOutputError(f"model did not return valid JSON: {exc}") from exc
+        raise StructuredOutputError("model did not return valid JSON", retry_feedback={
+            "message": str(exc)[:2000], "rejected_output": (text or "")[:12000]}) from exc
     try:
         error = next(validator.iter_errors(value), None)
     except Exception as exc:
         raise StructuredOutputError(f"could not validate structured output: {exc}") from exc
     if error is not None:
-        path = "/" + "/".join(str(part) for part in error.absolute_path)
-        raise StructuredOutputError(f"model output failed the JSON Schema at {path}: {error.message}")
+        diagnostics = {"validation_rule": str(getattr(error, "validator", "type"))[:64],
+                       "schema_path": list(getattr(error, "absolute_schema_path", ()))[:24]}
+        raise StructuredOutputError("model output failed the JSON Schema", diagnostics,
+                                    validation_feedback(error, value))
     return canonical
