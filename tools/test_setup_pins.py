@@ -299,6 +299,9 @@ class Requirements(unittest.TestCase):
         lines = setup.requirement_lines()
         legacy = sorted(setup.PY_PACKAGES) + ["nvidia-cublas==13.0.2.14"]
         deps = {"markupsafe", "certifi", "charset-normalizer", "idna", "urllib3", "colorama"}
+        # The fork adds mandatory schema validation to an older upstream install.
+        self.assertEqual(self.pip(legacy, lines, installed=deps)[0], ["jsonschema==4.25.1"])
+        deps.add("jsonschema")
         self.assertEqual(self.pip(legacy, lines, installed=deps)[0], [])
         missing = [p for p in legacy if p != "psutil"]                         # an older list without psutil
         ran, _ = self.pip(missing, lines, installed=deps)
