@@ -1,10 +1,21 @@
 # YakStack fork qualification
 
-This branch starts from upstream 0.1.39, commit
-`6f32ec070f23ced9f50e704d854d775da52591ab`. It targets YakStack's stateless
+This branch starts from upstream 0.1.40.1, commit
+`82f46a8c8f475f001ad76d92f58f4a4f8ffb0253` (engine 0.1.40). It targets YakStack's stateless
 Responses client on a single RTX 3090 with Qwen3.8-Flash-Next IQ2_XS,
 GPU vision, int8 KV streaming and four slots. No production migration is
 implied by the changes.
+
+The October 7 upgrade preserves the forced Responses, private structured JSON,
+bounded request-local retry feedback and continuation-cache corrections below.
+It also preserves upstream's reasoning/fence tool-parser guards and restart
+waiter fix. Batch MTP is evaluated separately from the runtime upgrade.
+
+Concurrent image requests can race the upstream `/dev/shm` free-space check.
+If writing combined embeddings hits `ENOSPC`, the server removes the partial
+file and retries in the encoder's disk directory. Disk failures still propagate
+and clean up partial files. This keeps the shared-memory fast path without
+requiring a larger Docker shared-memory mount.
 
 ## Forced Responses tools
 
