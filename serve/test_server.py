@@ -215,7 +215,7 @@ class FitMaxTokens(unittest.TestCase):
         self.assertIn("no room to answer", b["error"]["message"])
 
 
-class VisionTempFiles(unittest.TestCase):
+class VisionRequestCleanup(unittest.TestCase):
     """A request's combined image file (req-*.sve, ~10 MB a picture) goes with the request: one refused after prepare()
     wrote it (the engine starting, no room) or whose answer never started left it in the vision directory for good."""
 
@@ -518,6 +518,55 @@ class VisionTempFiles(unittest.TestCase):
                 return
             with mock.patch("serve.server.shutil.disk_usage", return_value=SimpleNamespace(free=1 << 20)):
                 self.assertEqual(combined_embeddings_path(Path(d), 1 << 20).parent, Path(d))
+
+    def test_a_shared_memory_space_race_retries_on_disk_and_removes_the_partial_file(self):
+        import errno
+        from serve.server import write_combined_embeddings, write_temporary
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            vision, shm = root / "vision", root / "shm"
+            vision.mkdir()
+            shm.mkdir()
+            part = root / "part.sve"
+            part.write_bytes(b"complete embeddings")
+            selected = shm / "req.sve"
+            writes = []
+
+            def write(path, parts):
+                writes.append(path)
+                if path == selected:
+                    path.write_bytes(b"partial")
+                    raise OSError(errno.ENOSPC, "another request filled shared memory")
+                write_temporary(path, parts)
+
+            with mock.patch("serve.server.combined_embeddings_path", return_value=selected), \
+                    mock.patch("serve.server.write_temporary", side_effect=write):
+                result = write_combined_embeddings(vision, [part])
+            self.assertEqual(result, vision / selected.name)
+            self.assertEqual(result.read_bytes(), part.read_bytes())
+            self.assertFalse(selected.exists())
+            self.assertEqual(writes, [selected, result])
+
+    def test_an_encoder_disk_space_failure_is_not_retried_or_left_behind(self):
+        import errno
+        from serve.server import write_combined_embeddings
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            part = root / "part.sve"
+            part.write_bytes(b"embeddings")
+            selected = root / "req.sve"
+
+            def write(path, parts):
+                path.write_bytes(b"partial")
+                raise OSError(errno.ENOSPC, "disk full")
+
+            with mock.patch("serve.server.combined_embeddings_path", return_value=selected), \
+                    mock.patch("serve.server.write_temporary", side_effect=write) as writer:
+                with self.assertRaises(OSError) as error:
+                    write_combined_embeddings(root, [part])
+            self.assertEqual(error.exception.errno, errno.ENOSPC)
+            self.assertEqual(writer.call_count, 1)
+            self.assertFalse(selected.exists())
 
     def test_smart_app_control_is_said_in_words(self):
         import subprocess

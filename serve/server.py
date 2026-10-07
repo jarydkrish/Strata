@@ -28,6 +28,7 @@ import hashlib
 import hmac
 import codecs
 import ctypes
+import errno
 import json
 import math
 import os
@@ -126,6 +127,29 @@ def write_temporary(path: Path, parts: list) -> None:
     with os.fdopen(os.open(path, flags, 0o600), "wb") as f:
         for part in parts:
             f.write(Path(part).read_bytes())
+
+
+def write_combined_embeddings(vision_dir: Path, parts: list) -> Path:
+    """Fall back to the encoder directory if concurrent requests fill /dev/shm.
+
+    The free-space check chooses a tier; it cannot reserve space against other
+    request threads. Remove a partial shared-memory file before retrying on disk.
+    """
+    vision_dir = Path(vision_dir)
+    path = combined_embeddings_path(vision_dir, sum(Path(p).stat().st_size for p in parts))
+    try:
+        try:
+            write_temporary(path, parts)
+        except OSError as error:
+            path.unlink(missing_ok=True)
+            if error.errno != errno.ENOSPC or path.parent == vision_dir:
+                raise
+            path = vision_dir / path.name
+            write_temporary(path, parts)
+        return path
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
 # #458: the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
 # template says nothing for: no xhigh sentence is medium there) says it, since the xhigh one stays at the top
 EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"
@@ -2848,9 +2872,7 @@ class Service:
             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
             # one more for every retry of a 503.  run() deletes it; drop_embeddings() if run() never starts.
-            combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded))
-            self.embeddings.path = combined             # first, so a half-written one is found as well
-            write_temporary(combined, [p for p, _ in encoded])
+            self.embeddings.path = write_combined_embeddings(self.vision.dir, [p for p, _ in encoded])
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
     def drop_embeddings(self) -> None:
